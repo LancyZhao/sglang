@@ -12,7 +12,7 @@ from typing import (
 )
 
 import torch
-from transformers import BaseImageProcessor
+from transformers import BaseImageProcessor, BatchFeature
 
 from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
@@ -55,6 +55,8 @@ _is_xpu = is_xpu()
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
     prefer_tokenized_input = False
+    # Opt in by naming the model's token-space strategy; it gates supported configs.
+    token_space_process_strategy_class = None
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -69,11 +71,21 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
 
+    @classmethod
+    def supports_token_space_processing(cls, hf_config):
+        return (
+            cls.token_space_process_strategy_class is not None
+            and cls.token_space_process_strategy_class.supports_token_space_processing(
+                hf_config
+            )
+        )
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
         self.server_args = server_args
         self.transport_mode = transport_mode
+        self.token_space_process_strategy = None
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
@@ -603,6 +615,85 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             self._move_processor_output_to_cpu(result)
 
         return result
+
+    def sglang_post_process(
+        self, ret: BatchFeature, processor=None
+    ) -> MultimodalProcessorOutput:
+        """Turn a processor-shaped BatchFeature into the serving output, as legacy does.
+
+        `processor` is the worker's processor clone; post-processing does not use it.
+        """
+        input_ids = ret["input_ids"].flatten()
+        mm_items = self.collect_mm_items_from_processor_output(ret)
+        mm_items = self._bind_and_finalize_mm_items(
+            mm_items,
+            input_ids=input_ids,
+            mm_tokens=self.mm_tokens,
+            images=None,
+        )
+        return self._build_mm_output(
+            ret, mm_items, input_ids, base_input_ids=input_ids.tolist()
+        )
+
+    def _build_mm_output(
+        self,
+        ret: BatchFeature,
+        mm_items: list[MultimodalDataItem],
+        input_ids: torch.Tensor,
+        *,
+        base_input_ids: Optional[list[int]] = None,
+    ) -> MultimodalProcessorOutput:
+        """Assemble the serving output from processor output and bound items.
+
+        Models that set `token_space_process_strategy_class` must override this.
+        """
+        raise NotImplementedError
+
+    def _get_mm_token_expansion_start_len(self, request_obj, start_len):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        if start_len is None:
+            start_len = (
+                request_obj.mm_token_expansion_start_len or 0
+                if isinstance(request_obj, GenerateReqInput)
+                else 0
+            )
+        return start_len
+
+    async def process_token_space_mm_data_async(
+        self,
+        image_data=None,
+        audio_data=None,
+        input_text="",
+        request_obj=None,
+        *,
+        video_data=None,
+        input_ids=None,
+        mm_token_expansion_start_len=None,
+        max_req_input_len=None,
+        **kwargs,
+    ) -> MultimodalProcessorOutput:
+        assert self.token_space_process_strategy is not None, (
+            f"{type(self).__name__} has no token-space process strategy attached"
+        )
+        mm_token_expansion_start_len = self._get_mm_token_expansion_start_len(
+            request_obj, mm_token_expansion_start_len
+        )
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if audio_data is None and request_obj is not None:
+            audio_data = request_obj.audio_data
+        ret = await self.load_and_process_token_space_async(
+            image_data,
+            video_data,
+            audio_data,
+            input_ids=input_ids,
+            input_text=input_text,
+            mm_token_expansion_start_len=mm_token_expansion_start_len,
+            add_special_tokens=kwargs.pop("add_special_tokens", True),
+            **kwargs,
+        )
+        return await self._run_mm_processor(self.sglang_post_process, ret=ret)
 
     @abstractmethod
     async def process_mm_data_async(
