@@ -49,6 +49,15 @@ class RecordingTokenizer:
         self.texts.append(text)
         return self.tokenizer.encode(text, **kwargs)
 
+    def apply_chat_template(self, *args, **kwargs):
+        # Kimi K3 tokenizes inside the template; record its text instead.
+        if kwargs.get("tokenize"):
+            text = self.tokenizer.apply_chat_template(
+                *args, **kwargs | {"tokenize": False}
+            )
+            self.texts.append(text)
+        return self.tokenizer.apply_chat_template(*args, **kwargs)
+
     def __getattr__(self, name):
         return getattr(self.tokenizer, name)
 
@@ -99,7 +108,11 @@ def generate(fixture_path):
         allow_patterns=["*.json", "*.jinja", "*.py", "*.model", "*.tiktoken"],
     )
     config = json.loads(Path(path, "config.json").read_text())
-    tok = RecordingTokenizer(AutoTokenizer.from_pretrained(path, local_files_only=True))
+    tok = RecordingTokenizer(
+        AutoTokenizer.from_pretrained(
+            path, local_files_only=True, trust_remote_code=True
+        )
+    )
     server = serving_chat(
         fixture["model"],
         path,
