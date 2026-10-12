@@ -17,7 +17,7 @@ use crate::policies::{Policy, PrefixLookupResult};
 use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
-use crate::server::metrics::PolicySelectionFailureReason;
+use crate::server::metrics::{PolicySelectionFailureReason, RequestLogContext};
 use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
@@ -25,7 +25,6 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use crate::server::metrics::RequestLogContext;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
@@ -115,8 +114,8 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, _) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    ModelRouting::lookup(&ctx, &request.model)?.dispatch(&ctx, request, headers, start).await
+    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
@@ -132,7 +131,13 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    let prepared = async {
+        let (request, routing) = prepare(ctx, endpoint, &headers, body, true).await?;
+        let workers = routing.select_workers(ctx, &request, &headers, &[]).await?;
+        Ok::<_, ApiError>((request, workers))
+    }
+    .await;
+    match prepared {
         Ok((mut request, workers)) => {
             forward_request_grpc(rpc, ctx, &mut request, workers, headers, start).await
         }
@@ -159,7 +164,9 @@ pub async fn route_typed<R: TypedRpc>(
             require_plain_workers(ctx, &model, path)?;
         }
         let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
-        let workers = routing.select_workers(ctx, &prepared, &headers, &[]).await?;
+        let workers = routing
+            .select_workers(ctx, &prepared, &headers, &[])
+            .await?;
         Ok((prepared, workers))
     };
     match prepared.await {
@@ -191,14 +198,14 @@ impl Endpoint {
     }
 }
 
-/// Validate the body and select workers, as `endpoint` does over HTTP.
-async fn prepare(
-    ctx: &AppContext,
+/// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
+async fn prepare<'a>(
+    ctx: &'a AppContext,
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
     grpc: bool,
-) -> Result<(PreparedRequest, SelectedWorkers), ApiError> {
+) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
     let served_model = || ModelId(ctx.config.model.id.clone());
     let (routing, request) = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
@@ -208,8 +215,14 @@ async fn prepare(
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let routing = ModelRouting::lookup(ctx, &model)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
-            let path = if matches!(endpoint, Endpoint::Chat) { CHAT_PATH } else { COMPLETIONS_PATH };
-            let request = if grpc {
+            let path = if matches!(endpoint, Endpoint::Chat) {
+                CHAT_PATH
+            } else {
+                COMPLETIONS_PATH
+            };
+            let request = if grpc && matches!(endpoint, Endpoint::Completions) {
+                PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
+            } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
             } else {
                 PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
@@ -236,8 +249,7 @@ async fn prepare(
             (routing, PreparedRequest::rerank(model, body)?)
         }
     };
-    let workers = routing.select_workers(ctx, &request, headers, &[]).await?;
-    Ok((request, workers))
+    Ok((request, routing))
 }
 
 /// Prefill and decode engines serve generation only.
