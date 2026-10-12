@@ -371,11 +371,13 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        # ReduceOp is compared by identity: Dynamo before torch 2.14 cannot trace
+        # RedOpType.__eq__ and graph-breaks the compiled all-reduce on it.
         elif (
             torch.compiler.is_compiling()
             and self.srt_custom_allreduce is not None
             and not async_op
-            and op == torch.distributed.ReduceOp.SUM
+            and op is torch.distributed.ReduceOp.SUM
             and not input_.is_cpu
         ):
             return diffusion_all_reduce(input_, group_name=self.unique_name)
@@ -384,7 +386,7 @@ class GroupCoordinator:
             if (
                 not async_op
                 and custom_ar is not None
-                and op == torch.distributed.ReduceOp.SUM
+                and op is torch.distributed.ReduceOp.SUM
                 and not input_.is_cpu
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
